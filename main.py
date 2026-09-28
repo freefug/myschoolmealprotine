@@ -1,194 +1,118 @@
-import streamlit as st
-import pandas as pd
-import requests
-import re
 import datetime
-import plotly.express as px
+import re
+import requests
+import streamlit as st
 
-# -------------------------------------------------------------------
-# 1. 페이지 기본 설정 및 스타일 정의
-# -------------------------------------------------------------------
-st.set_page_config(
-    page_title="학교별 요일별 단백질 함량 분석",
-    page_icon="🍱",
-    layout="wide"
-)
+# 1. API 키 불러오기
+NICE_KEY = st.secrets.get("NICE_KEY", "177346823acb41daa7e14dd10ce3a065")
 
-st.title("🍱 학교별 요일별 평균 단백질 함량 비교 분석")
-st.caption("나이스(NEIS) 급식 API의 반정형 데이터(JSON)를 활용하여 학교별/요일별 영양 성분을 분석합니다.")
+st.set_page_config(page_title="전국 고등학교 급식 조회", page_icon="🍱")
+st.title("🍱 전국 고등학교 급식 정보 조회")
 
-# Secrets 키 불러오기 (없는 경우 예외 처리)
-API_KEY = st.secrets.get("NEIS_API_KEY", "")
-
-if not API_KEY:
-    st.warning("⚠️ `.streamlit/secrets.toml` 파일에 `NEIS_API_KEY`가 설정되어 있지 않습니다.")
-
-# -------------------------------------------------------------------
-# 2. 기본 비교 학교 데이터 및 API 호출 함수
-# -------------------------------------------------------------------
-DEFAULT_SCHOOLS = [
-    {"SCHUL_NM": "송탄고등학교", "ATPT_OFCDC_SC_CODE": "J10", "SD_SCHUL_CODE": "7530480"},
-    {"SCHUL_NM": "평택고등학교", "ATPT_OFCDC_SC_CODE": "J10", "SD_SCHUL_CODE": "7530864"},
-    {"SCHUL_NM": "효명고등학교", "ATPT_OFCDC_SC_CODE": "J10", "SD_SCHUL_CODE": "7530176"}
-]
-
-DAYS_KR = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
-
-def parse_protein(ntr_info_str):
-    """
-    NTR_INFO 문자열에서 '단백질(g)' 함량 숫자를 정규표현식으로 추출
-    예: "단백질(g) : 34.5" -> 34.5
-    """
-    if not ntr_info_str:
-        return None
-    match = re.search(r'단백질\s*\(g\)\s*:\s*([\d.]+)', ntr_info_str)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
-    return None
-
-@st.cache_data(ttl=3600)
-def fetch_meal_data(api_key, ofcdc_code, schul_code, from_ymd, to_ymd):
-    """나이스 급식식단정보 API 호출 함수"""
-    url = "https://open.neis.go.kr/hub/mealServiceDietInfo"
+# ----------------------------------------------------
+# Helper 함수: 학교 정보 검색 (학교코드, 교육청코드 조회)
+# ----------------------------------------------------
+def search_school(school_name):
+    url = "https://open.neis.go.kr/hub/schoolInfo"
     params = {
-        "KEY": api_key,
+        "KEY": NICE_KEY,
         "Type": "json",
         "pIndex": 1,
-        "pSize": 1000,
-        "ATPT_OFCDC_SC_CODE": ofcdc_code,
-        "SD_SCHUL_CODE": schul_code,
-        "MMEAL_SC_CODE": "2",  # 중식
-        "MLSV_FROM_YMD": from_ymd,
-        "MLSV_TO_YMD": to_ymd
+        "pSize": 100,
+        "SCHUL_NM": school_name,
+        "SCHUL_KND_SC_NM": "고등학교",  # 고등학교로 제한
     }
+    res = requests.get(url, params=params).json()
     
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        if "mealServiceDietInfo" in data:
-            return data["mealServiceDietInfo"][1]["row"]
-        else:
-            return []
-    except Exception as e:
-        st.error(f"API 호출 중 오류 발생: {e}")
-        return []
+    if "schoolInfo" in res:
+        rows = res["schoolInfo"][1]["row"]
+        return rows
+    return []
 
-# -------------------------------------------------------------------
-# 3. 사이드바 (조회 기간 및 학교 선택)
-# -------------------------------------------------------------------
-st.sidebar.header("🔍 분석 조건 설정")
+# ----------------------------------------------------
+# Helper 함수: 기간별 급식 목록 조회
+# ----------------------------------------------------
+def get_meal_info(office_code, school_code, start_date, end_date):
+    url = "https://open.neis.go.kr/hub/mealServiceDietInfo"
+    params = {
+        "KEY": NICE_KEY,
+        "Type": "json",
+        "pIndex": 1,
+        "pSize": 100,
+        "ATPT_OFCDC_SC_CODE": office_code,
+        "SD_SCHUL_CODE": school_code,
+        "MLSV_FROM_YMD": start_date.strftime("%Y%m%d"),
+        "MLSV_TO_YMD": end_date.strftime("%Y%m%d"),
+    }
+    res = requests.get(url, params=params).json()
+    
+    if "mealServiceDietInfo" in res:
+        return res["mealServiceDietInfo"][1]["row"]
+    return []
 
-# 기간 선택 (기본값: 최근 1개월)
-today = datetime.date.today()
-first_day_of_month = today.replace(day=1)
-date_range = st.sidebar.date_input(
-    "조회 기간 선택",
-    value=(first_day_of_month, today),
-    max_value=today
-)
+# ----------------------------------------------------
+# UI 구성
+# ----------------------------------------------------
+col1, col2 = st.columns([2, 1])
 
-# 학교 선택
-selected_school_names = st.sidebar.multiselect(
-    "비교할 학교 선택 (최소 3개교 권장)",
-    options=[s["SCHUL_NM"] for s in DEFAULT_SCHOOLS],
-    default=[s["SCHUL_NM"] for s in DEFAULT_SCHOOLS]
-)
+with col1:
+    school_name_input = st.text_input("고등학교 이름을 입력하세요", value="휘문고등학교")
 
-# -------------------------------------------------------------------
-# 4. 데이터 수집 및 처리
-# -------------------------------------------------------------------
-if len(date_range) == 2:
-    start_date, end_date = date_range
-    from_ymd = start_date.strftime("%Y%m%d")
-    to_ymd = end_date.strftime("%Y%m%d")
+# 검색된 학교 선택
+schools = []
+if school_name_input.strip():
+    schools = search_school(school_name_input.strip())
 
-    parsed_rows = []
-
-    if selected_school_names:
-        with st.spinner("나이스 API에서 급식 데이터를 가져오는 중..."):
-            for school in DEFAULT_SCHOOLS:
-                if school["SCHUL_NM"] in selected_school_names:
-                    raw_meals = fetch_meal_data(
-                        API_KEY,
-                        school["ATPT_OFCDC_SC_CODE"],
-                        school["SD_SCHUL_CODE"],
-                        from_ymd,
-                        to_ymd
-                    )
-                    
-                    for row in raw_meals:
-                        ymd_str = row.get("MLSV_YMD", "")
-                        if not ymd_str:
-                            continue
-                        
-                        date_obj = datetime.datetime.strptime(ymd_str, "%Y%m%d").date()
-                        weekday_num = date_obj.weekday()
-                        
-                        # 평일(월~금) 데이터만 추출
-                        if weekday_num < 5:
-                            ntr_str = row.get("NTR_INFO", "")
-                            protein = parse_protein(ntr_str)
-                            
-                            if protein is not None:
-                                parsed_rows.append({
-                                    "학교명": school["SCHUL_NM"],
-                                    "날짜": date_obj,
-                                    "요일": DAYS_KR[weekday_num],
-                                    "요일순서": weekday_num,
-                                    "단백질(g)": protein,
-                                    "메뉴": row.get("DDISH_NM", "").replace("<br/>", ", "),
-                                    "칼로리": row.get("CAL_INFO", "")
-                                })
-
-        df = pd.DataFrame(parsed_rows)
-
-        # -------------------------------------------------------------------
-        # 5. 분석 결과 시각화 (Main 화면)
-        # -------------------------------------------------------------------
-        if not df.empty:
-            # 요일별/학교별 단백질 평균 집계
-            avg_df = df.groupby(["학교명", "요일", "요일순서"])["단백질(g)"].mean().reset_index()
-            avg_df = avg_df.sort_values(by="요일순서")
-
-            # 가장 단백질이 풍부한 요일 계산
-            overall_day_avg = avg_df.groupby("요일")["단백질(g)"].mean()
-            best_day = overall_day_avg.idxmax()
-            best_val = overall_day_avg.max()
-
-            # 핵심 결론 메트릭 강조
-            st.success(f"💡 **분석 결과**: 선택한 학교들의 평균 단백질 함량이 가장 높은 요일은 **[{best_day}]** 입니다! (평균 **{best_val:.1f}g**)")
-
-            # Plotly 막대 그래프 생성
-            fig = px.bar(
-                avg_df,
-                x="요일",
-                y="단백질(g)",
-                color="학교명",
-                barmode="group",
-                title="<b>학교별 요일별 평균 단백질 함량 비교</b>",
-                text_auto=".1f",
-                category_orders={"요일": ["월요일", "화요일", "수요일", "목요일", "금요일"]}
-            )
-            fig.update_layout(xaxis_title="요일", yaxis_title="평균 단백질 (g)", legend_title="학교")
-            
-            st.plotly_chart(fig, use_container_width=True)
-
-            # 상세 요약 표
-            st.subheader("📊 요일별/학교별 단백질 평균 요약표")
-            pivot_df = avg_df.pivot(index="학교명", columns="요일", values="단백질(g)")[["월요일", "화요일", "수요일", "목요일", "금요일"]]
-            st.dataframe(pivot_df.style.highlight_max(axis=1, color="#d4edda"), use_container_width=True)
-
-            # 상세 raw 데이터 보기
-            with st.expander("📄 전체 조회 데이터 상세 보기"):
-                st.dataframe(df[["학교명", "날짜", "요일", "단백질(g)", "칼로리", "메뉴"]], use_container_width=True)
-
-        else:
-            st.warning("지정한 기간에 해당하는 급식 영양 데이터가 없거나, API 요청 건수를 초과했습니다.")
-    else:
-        st.info("사이드바에서 비교할 학교를 선택해 주세요.")
+if not schools:
+    st.warning("검색된 고등학교가 없습니다. 정확한 학교명을 입력해주세요.")
 else:
-    st.info("조회 기간을 선택해 주세요.")
+    # 검색된 학교가 여러 개일 경우 선택 박스 제공
+    school_options = {f"{s['SCHUL_NM']} ({s['LCTN_SC_NM']})": s for s in schools}
+    selected_school_label = st.selectbox("학교 선택", list(school_options.keys()))
+    selected_school = school_options[selected_school_label]
+
+    st.markdown("---")
+    
+    # 날짜 범위 선택 (1일~30일 등 자유롭게 설정 가능)
+    st.subheader("📅 조회 기간 선택")
+    today = datetime.date.today()
+    first_day = today.replace(day=1)
+    
+    date_range = st.date_input(
+        "조회할 기간을 선택하세요 (시작일 ~ 종료일)",
+        value=(first_day, today),
+    )
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+        
+        # 급식 불러오기 버튼
+        if st.button("급식 조회하기", type="primary"):
+            with st.spinner("급식 정보를 불러오는 중..."):
+                meals = get_meal_info(
+                    selected_school["ATPT_OFCDC_SC_CODE"],
+                    selected_school["SD_SCHUL_CODE"],
+                    start_date,
+                    end_date,
+                )
+            
+            if not meals:
+                st.info("해당 기간에는 급식 정보가 없습니다.")
+            else:
+                st.success(f"총 {len(meals)}건의 급식 정보를 찾았습니다!")
+                
+                # 일자별 표시
+                for meal in meals:
+                    # YYYYMMDD -> YYYY-MM-DD 변환
+                    raw_date = meal["MLSV_YMD"]
+                    formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
+                    meal_type = meal.get("MMEAL_SC_NM", "중식")
+                    
+                    # HTML 태그 <br/> 및 알레르기 번호 제거 정제
+                    dish_clean = meal["DDISH_NM"].replace("<br/>", "\n")
+                    dish_clean = re.sub(r"\([0-9\.]+\)", "", dish_clean)  # 알레르기 번호 제거
+                    
+                    with st.expander(f"📌 {formatted_date} ({meal_type})"):
+                        st.text(dish_clean)
+                        if "CAL_INFO" in meal:
+                            st.caption(f"🔥 칼로리: {meal['CAL_INFO']}")
